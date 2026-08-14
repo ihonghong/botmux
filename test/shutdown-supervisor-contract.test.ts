@@ -384,7 +384,12 @@ describe('graceful shutdown supervisor contract', () => {
     expect(legacy).toContain('assertNoDuplicatePm2GodDaemons(legacyHome)');
     expect(legacy).toContain('preflightNodeSanity(legacyHome)');
 
-    expect(cli).not.toContain("runPm2(['kill']");
+    // `pm2 kill` slaughters every managed app without the safe shutdown
+    // handshake, so the ONLY permitted call site is the include-pm2 God
+    // retirement inside cmdRestart, which runs strictly after the fleet is
+    // verified retired (pinned by the God-retirement contract test below).
+    expect(legacy).not.toContain("runPm2(['kill']");
+    expect(cli.split("runPm2(['kill']").length - 1).toBe(1);
   });
 
   it('exposes an explicit double-confirmed first-upgrade bootstrap without weakening normal shutdown', () => {
@@ -407,21 +412,26 @@ describe('graceful shutdown supervisor contract', () => {
     expect(cli).toContain('botmux restart --bootstrap-shutdown-protocol --yes');
   });
 
-  it('rejects include-pm2 before breadcrumb/fleet mutation when a live God exists', () => {
+  it('retires the God only after the fleet is verified retired, and never by PID signal', () => {
     const start = cli.indexOf('async function cmdRestart()');
     const end = cli.indexOf('/**\n * Bring a SINGLE bot', start);
     const restart = cli.slice(start, end);
-    const admission = restart.indexOf(
-      'assertIncludePm2RestartAdmission(listPm2GodDaemonPids())',
-    );
-    const consume = restart.indexOf('consumeRestartIntentTo(');
-    const retire = restart.indexOf('deleteAllBotmuxProcesses()');
-    expect(admission).toBeGreaterThanOrEqual(0);
-    expect(consume).toBeGreaterThan(admission);
-    expect(retire).toBeGreaterThan(consume);
+    const coreRetire = restart.indexOf('deleteAllBotmuxProcesses()');
+    const pluginStop = restart.indexOf('stopPluginServicesForCli(undefined, {})');
+    const verifyEmpty = restart.indexOf("readVerifiedBotmuxPm2Projection('restart-start')");
+    const godRetire = restart.indexOf('retireSoleLivePm2God(');
+    const freshStart = restart.indexOf('runBoundedPm2StartTransaction(');
+    expect(coreRetire).toBeGreaterThanOrEqual(0);
+    expect(pluginStop).toBeGreaterThan(coreRetire);
+    expect(verifyEmpty).toBeGreaterThan(pluginStop);
+    expect(godRetire).toBeGreaterThan(verifyEmpty);
+    expect(freshStart).toBeGreaterThan(godRetire);
+    // Socket-addressed kill only — a raw PID signal cannot be generation-bound.
+    expect(restart).toContain("runPm2(['kill']");
     expect(restart).not.toContain('killPm2GodDaemon');
-    expect(cli).toContain('--include-pm2 仅允许“入场时没有 live PM2 God”的干净启动');
-    expect(cli).not.toContain('--include-pm2 同时重启 PM2 God');
+    const godRetirement = readFileSync(new URL('../src/cli/pm2-god-retirement.ts', import.meta.url), 'utf8');
+    expect(godRetirement).not.toContain('process.kill');
+    expect(cli).toContain('cannot be combined with --include-pm2');
   });
 
   it('attests the whole daemon fleet then uses exact IPC batch/successor requests', () => {

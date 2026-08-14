@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
+import { scrubInvokerTerminalEnv, scrubSessionTurnMarkerEnv } from '../../utils/child-env.js';
 
 const require = createRequire(import.meta.url);
 const BOTMUX_HOME = join(homedir(), '.botmux');
@@ -36,6 +37,17 @@ function pm2Env(extra?: Record<string, string>): NodeJS.ProcessEnv {
   // stripPm2GracefulExitMarker.
   const inherited = stripPm2GracefulExitMarker(process.env);
   delete inherited.kill_timeout;
+  // Plugin PM2 shares the God's PM2_HOME, so this boundary can both bake the
+  // caller's env into a plugin app AND birth the God itself. Keep the same
+  // invoker hygiene as cli.ts pm2Env(): no agent-shell terminal fingerprints
+  // (NO_COLOR/CODEX_CI/… — see INVOKER_TERMINAL_ENV_KEYS), no turn-scoped
+  // session identity (a plugin service with a baked BOTMUX_SESSION_ID would
+  // misroute its own `botmux send` to a long-dead thread).
+  scrubInvokerTerminalEnv(inherited);
+  scrubSessionTurnMarkerEnv(inherited);
+  // Same TERM re-pin as cli.ts pm2Env(): deterministic instead of absent, so
+  // pm2 client output on a real TTY keeps color detection.
+  inherited.TERM = 'xterm-256color';
   return { ...inherited, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
 }
 

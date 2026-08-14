@@ -9,7 +9,8 @@
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
  *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services;
- *     --include-pm2 is a zero-live-God admission fence, not authority to signal an existing PM2 God
+ *     --include-pm2 additionally retires the PM2 God after the fleet is verified retired
+ *     (socket-addressed `pm2 kill`, never a PID signal) so the whole tree restarts from a fresh env
  *   botmux restart --bootstrap-shutdown-protocol --yes — operator-approved one-time retirement
  *     of a pre-protocol fleet after independently confirming all Session/Riff work is idle
  *   botmux logs [--lines] — view daemon logs
@@ -95,7 +96,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -148,7 +149,7 @@ import {
   restartFailurePathIn,
 } from './cli/restart-failure-notification.js';
 import { resolveRestartFailureOwner } from './cli/restart-failure-owner.js';
-import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
+import { retireSoleLivePm2God } from './cli/pm2-god-retirement.js';
 import {
   requestAttestedDaemonShutdown,
   requestAttestedDaemonShutdownBatch,
@@ -315,6 +316,8 @@ const PM2_NAME = 'botmux';
 const PM2_HOME = join(CONFIG_DIR, 'pm2');
 const PM2_FLEET_MUTATION_LOCK_TARGET = join(CONFIG_DIR, 'pm2-fleet-mutation');
 const PM2_START_COMMAND_TIMEOUT_MS = 30_000;
+// `pm2 kill` with an already-empty fleet only tears down the God + socket.
+const PM2_GOD_KILL_COMMAND_TIMEOUT_MS = 30_000;
 const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;
 const PM2_START_VERIFY_PER_PROCESS_MS = 2_000;
 const PM2_START_LATE_PUBLICATION_SETTLE_MS = 10_000;
@@ -376,6 +379,19 @@ function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
   // them in PM2 would make every daemon — and then every ordinary chat worker
   // it forks — run in workflow mode after a restart initiated from that node.
   scrubWorkflowWorkerEnv(env);
+  // Invoker-terminal fingerprints (NO_COLOR=1 / CODEX_CI=1 / PAGER=cat from
+  // an agent's non-interactive shell) ride the same persistence vector; baked
+  // in they turn every session PTY on the machine colorless. Same class, same
+  // boundary — see INVOKER_TERMINAL_ENV_KEYS.
+  scrubInvokerTerminalEnv(env);
+  // Turn-scoped session identity of the invoking bot session must not become
+  // fleet-wide daemon env — the daemon stays session-agnostic.
+  scrubSessionTurnMarkerEnv(env);
+  // Re-pin TERM to the constant every botmux PTY already forces. Deleting it
+  // outright would make the pm2 CLIENT (e.g. `botmux logs` streaming to a real
+  // TTY) fail supports-color detection and render colorless; pinning keeps the
+  // baked value deterministic and invoker-independent instead of absent.
+  env.TERM = 'xterm-256color';
   return env;
 }
 
@@ -3708,9 +3724,6 @@ async function cmdRestart(): Promise<void> {
     if (bootstrapShutdownProtocol && includePm2) {
       throw new Error('[restart] --bootstrap-shutdown-protocol cannot be combined with --include-pm2');
     }
-    if (includePm2) {
-      assertIncludePm2RestartAdmission(listPm2GodDaemonPids());
-    }
 
     const restartIntentDir = resolveDataDir();
     let stagedRestartIntent: RestartIntent | null = null;
@@ -3722,17 +3735,16 @@ async function cmdRestart(): Promise<void> {
     preflightNodeSanity();
     await ensureSystemDependencies();
     cleanupLegacyPm2(bootstrapShutdownProtocol ? 'restart' : undefined);
-    if (bootstrapShutdownProtocol || includePm2) {
-      // An include-pm2 restart was admitted only when no live PM2 God existed;
-      // a read-only jlist probe would start one and invalidate that admission.
-      // Keep the existing include-pm2 clean-start path unchanged.
-      if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
-      else deleteAllBotmuxProcesses();
+    if (bootstrapShutdownProtocol) {
+      bootstrapDeleteAllBotmuxProcesses('restart');
     } else {
       // This process is the newly installed code generation even when the
       // Dashboard that spawned it is still the old in-memory generation. Do
       // the policy probe here, before the generic retirement path throws, so
       // the first-upgrade failure becomes durable and reaches the owner.
+      // --include-pm2 takes this path too: the probe's lazy jlist may start a
+      // PM2 God, which is harmless now — God retirement below runs after the
+      // fleet is verified retired, against whichever God owns the home.
       const preflight = evaluateRestartShutdownPreflight();
       if (preflight.bootstrapRequired) {
         const detail = 'current daemon PM2 policy requires the one-time shutdown-protocol bootstrap';
@@ -3752,7 +3764,11 @@ async function cmdRestart(): Promise<void> {
       }
       deleteAllBotmuxProcesses();
     }
-    if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+    // --include-pm2 tears down the whole PM2_HOME, so ALL plugin services get
+    // a graceful stop first instead of dying with the God; auto ones are
+    // re-ensured after the restart, manually-started ones stay down.
+    if (includePm2) await stopPluginServicesForCli(undefined, {});
+    else if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
     cleanupStaleDaemonDescriptors();
 
     const retiredProjection = readVerifiedBotmuxPm2Projection('restart-start');
@@ -3762,6 +3778,23 @@ async function cmdRestart(): Promise<void> {
         `[restart-start] new PM2 core row(s) appeared after verified retirement: `
         + retiredProjection.map(entry => `${entry.name}:${entry.pid}`).join(', '),
       );
+    }
+
+    // Only now — with the core fleet verified retired and plugin services
+    // stopped — is the God a stateless supervisor of nothing, safe to retire
+    // via its own control socket. The fresh `pm2 start` below then births a
+    // new God from this CLI's (pm2Env-scrubbed) environment, which is what
+    // makes --include-pm2 a genuinely complete restart.
+    if (includePm2) {
+      const retired = await retireSoleLivePm2God({
+        listGodPids: () => listPm2GodDaemonPids(),
+        readStartIdentity: pid => readSupervisorProcessStartIdentity(pid),
+        isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+        pm2Kill: () => runPm2(['kill'], true, PM2_HOME, PM2_GOD_KILL_COMMAND_TIMEOUT_MS),
+        sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+        now: () => Date.now(),
+      });
+      if (retired) console.log(`已退役 PM2 God (pid ${retired.pid})，fleet 将以当前干净环境全新启动`);
     }
 
     await withFileLock(BOTS_JSON_FILE, async () => {
@@ -6834,7 +6867,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   start       启动 daemon，并启动 mode=auto 的插件 service
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
   restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
-              --include-pm2 仅允许“入场时没有 live PM2 God”的干净启动；若已有 live God，整条命令会在 fleet/breadcrumb 零改动处拒绝，且不会信号或重启现存 God
+              --include-pm2 在 fleet 安全退役并验证后，经 PM2_HOME socket 退役 PM2 God（绝不按 PID 发信号），再以当前干净环境全新启动——彻底重启整棵进程树；会先优雅停止全部插件 service（auto 的启动后自动恢复）
               首次升级若旧 daemon 缺少 shutdown protocol：先独立确认所有 Session/Riff 工作均 idle，再一次性运行
               botmux restart --bootstrap-shutdown-protocol --yes；普通 stop/restart 仍保持 fail-closed
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）

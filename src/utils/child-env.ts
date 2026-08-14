@@ -84,6 +84,81 @@ export function scrubClaudeSessionMarkerEnv(env: NodeJS.ProcessEnv): void {
 }
 
 /**
+ * Terminal/interactivity fingerprints of whichever process invoked a pm2
+ * mutation. pm2 persists the caller's env into every managed app (and into
+ * dump.pm2 for resurrect), so a `botmux restart` issued from an agent's
+ * non-interactive shell — Claude Code / Codex tool shells export NO_COLOR=1,
+ * CODEX_CI=1, PAGER=cat, plus the terminal-app identity of whatever terminal
+ * hosted them — bakes "you have no colors, you are in CI" into every daemon,
+ * which every worker and session PTY then inherits: all bot CLI TUIs render
+ * colorless, and TERMINFO can even point at a terminal app's private terminfo
+ * dir. A daemon is a headless service: every key here describes the invoker's
+ * terminal or harness, never the machine, so deleting them at the pm2
+ * boundary is always correct. Session PTYs set their own TERM (the backends
+ * spawn with name 'xterm-256color'), and a user who wants genuinely colorless
+ * bots keeps the per-bot `env` channel — like CLAUDE_EFFORT, the ambient
+ * "export it in the shell that runs `botmux restart`" channel is sacrificed
+ * because at this boundary it cannot be told apart from contamination.
+ */
+export const INVOKER_TERMINAL_ENV_KEYS = [
+  // Color semantics
+  'NO_COLOR',
+  'FORCE_COLOR',
+  'CLICOLOR',
+  'CLICOLOR_FORCE',
+  // Terminal identity
+  'TERM',
+  'COLORTERM',
+  'TERMINFO',
+  'TERMINFO_DIRS',
+  'TERM_PROGRAM',
+  'TERM_PROGRAM_VERSION',
+  'TERM_SESSION_ID',
+  // CI / agent-harness flags
+  'CI',
+  'CODEX_CI',
+  // Non-interactive pager pins agent shells export for their own subcommands
+  'PAGER',
+  'GIT_PAGER',
+  'GH_PAGER',
+] as const;
+
+/** Delete inherited invoker-terminal fingerprints from `env` in place. */
+export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of INVOKER_TERMINAL_ENV_KEYS) delete env[key];
+}
+
+/**
+ * Turn-scoped botmux session identity of the process that invoked a pm2
+ * mutation. A `botmux restart` issued from inside a bot session carries that
+ * session's routing identity (session/chat/turn ids, the daemon-authenticated
+ * owner — see the owner-identity invariants in CLAUDE.md); baked into the
+ * fleet it makes every daemon carry a stale foreign turn identity, and a
+ * plugin service started from the same env would misroute its own `botmux
+ * send` to a long-dead thread. These keys are always computed per session by
+ * the daemon/worker (BOTMUX_INJECTED_ENV_KEYS injection), never legitimate
+ * ambient config, so the pm2 boundary deletes them unconditionally.
+ * Deliberately narrow: keys that double as documented ambient daemon config
+ * (BOTS_CONFIG, BOTMUX_PUBLIC_URL, …) stay out.
+ */
+export const SESSION_TURN_MARKER_ENV_KEYS = [
+  'BOTMUX_SESSION_ID',
+  'BOTMUX_CHAT_ID',
+  'BOTMUX_CHAT_TYPE',
+  'BOTMUX_ROOT_MESSAGE_ID',
+  'BOTMUX_TURN_ID',
+  'BOTMUX_DISPATCH_ATTEMPT',
+  'BOTMUX_ORIGIN_CHANNEL_ID',
+  'BOTMUX_OWNER_OPEN_ID',
+  '__OWNER_OPEN_ID',
+] as const;
+
+/** Delete inherited turn-scoped session identity from `env` in place. */
+export function scrubSessionTurnMarkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of SESSION_TURN_MARKER_ENV_KEYS) delete env[key];
+}
+
+/**
  * Env vars that must never reach a spawned CLI child. The bot's IM-app creds
  * (a child CLI's own Lark OAuth reads `process.env.LARK_APP_ID` as the app to
  * authorize and gets hijacked by the botmux IM app → no docs scopes → 403

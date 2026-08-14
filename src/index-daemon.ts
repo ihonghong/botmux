@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubInvokerTerminalEnv, scrubSessionCliHomeEnv, scrubSessionTurnMarkerEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
@@ -26,9 +26,11 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 // v3 workflow workers spread this process's env into their spawn env, so a
 // restart issued from a bot session would otherwise pin that session's owner
 // onto every workflow CLI child.
-for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_OWNER_OPEN_ID', '__OWNER_OPEN_ID']) {
-  delete process.env[k];
-}
+scrubSessionTurnMarkerEnv(process.env);
+// Daemon-boot-only extra: the daemon resolves its own bot via BOTMUX_BOT_INDEX
+// and must not trust an inherited app id. Kept out of the shared turn-marker
+// list because ecosystemConfig legitimately pins BOTMUX_LARK_APP_ID per app.
+delete process.env.BOTMUX_LARK_APP_ID;
 // Same vector, session-level CLI data-root pointers (CLAUDE_CONFIG_DIR /
 // CODEX_HOME): a value baked into pm2's saved app env — or resurrected from a
 // stale dump.pm2, which bypasses the pm2Env() strip in cli.ts — would make
@@ -46,6 +48,13 @@ scrubClaudeSessionMarkerEnv(process.env);
 // code or forking ordinary chat workers. The ephemeral pool re-adds the exact
 // markers only to genuine workflow workers.
 scrubWorkflowWorkerEnv(process.env);
+// Same vector once more, invoker-terminal fingerprints: NO_COLOR=1 /
+// CODEX_CI=1 / PAGER=cat baked by a restart issued from an agent's
+// non-interactive shell (or resurrected from a stale dump) would flow into
+// every worker and session PTY and render every bot TUI colorless. Scrubbing
+// here also heals an already-poisoned fleet on its next daemon boot without
+// waiting for a clean-shell restart. See INVOKER_TERMINAL_ENV_KEYS.
+scrubInvokerTerminalEnv(process.env);
 
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading
