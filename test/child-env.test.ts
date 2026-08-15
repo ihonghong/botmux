@@ -374,6 +374,11 @@ describe('session CLI home scrub call sites', () => {
     // TTY-attached `botmux logs` keeps supports-color detection.
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain("env.TERM = 'xterm-256color'");
     expect(pluginPm2).toContain("TERM = 'xterm-256color'");
+    // Daemon boot must re-pin too: the boot scrub runs AFTER pm2Env() baked
+    // its snapshot, so without this the daemon (and every forked worker) runs
+    // TERM-less — the zmx backend's sessions inherit that env verbatim (no
+    // node-pty `name` to force TERM) and their CLIs render colorless.
+    expect(read('index-daemon.ts')).toContain("process.env.TERM = 'xterm-256color'");
   });
 
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {

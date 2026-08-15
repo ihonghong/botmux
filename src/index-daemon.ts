@@ -55,6 +55,12 @@ scrubWorkflowWorkerEnv(process.env);
 // here also heals an already-poisoned fleet on its next daemon boot without
 // waiting for a clean-shell restart. See INVOKER_TERMINAL_ENV_KEYS.
 scrubInvokerTerminalEnv(process.env);
+// Re-pin TERM after the scrub, same constant as both pm2Env() entries:
+// deterministic instead of absent. Workers fork from this env, and the zmx
+// backend's fresh sessions inherit the create client's env verbatim (zmx has
+// no node-pty `name` forcing TERM) — left absent, every CLI in a zmx session
+// fails supports-color detection and renders colorless.
+process.env.TERM = 'xterm-256color';
 
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading
