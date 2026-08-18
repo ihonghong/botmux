@@ -32,6 +32,58 @@ export interface RetiredPm2God {
   startIdentity: string | undefined;
 }
 
+export interface Pm2RegistryRowLiveness {
+  name: string;
+  status: string | undefined;
+  pid: number | undefined;
+}
+
+/** Registry statuses that prove no process is running for the row. */
+const TERMINAL_PM2_ROW_STATUSES: ReadonlySet<string> = new Set(['stopped', 'errored']);
+
+/**
+ * `pm2 kill` slaughters every process the God still manages without any
+ * graceful handshake, so the God may only be retired once the WHOLE registry
+ * is quiescent: every row — core, plugin, or an orphaned row a plugin
+ * uninstall left behind — must be in a terminal status with no live pid. A
+ * plugin stop that failed (stop errors are collected into reports, not
+ * rethrown) or a leftover running `botmux-plugin-*` row therefore blocks the
+ * kill here, fail-closed, instead of being silently killed with the God.
+ */
+export function assertPm2RegistryQuiescentForGodRetirement(
+  rows: readonly Pm2RegistryRowLiveness[],
+): void {
+  const live = rows.filter(row => {
+    const status = (row.status ?? '').trim();
+    const pidLive = typeof row.pid === 'number' && Number.isSafeInteger(row.pid) && row.pid > 0;
+    return pidLive || !TERMINAL_PM2_ROW_STATUSES.has(status);
+  });
+  if (live.length === 0) return;
+  const detail = live
+    .map(row => `${row.name}:${row.status ?? 'unknown'}${row.pid ? `:pid ${row.pid}` : ''}`)
+    .join(', ');
+  throw new Error(
+    `[restart --include-pm2] refusing pm2 kill: PM2 registry still has live/unproven row(s): ${detail}; `
+    + 'stop or delete them first (e.g. a plugin service that failed to stop, or a leftover '
+    + 'botmux-plugin-* row from an uninstalled plugin); the God and every remaining process were left untouched',
+  );
+}
+
+/**
+ * Between God retirement and the fresh `pm2 start`, any pm2 client invocation
+ * (even a read-only jlist from another shell) lazily births a God from ITS
+ * environment, not from this restart's cleaned one. Accepting it would defeat
+ * the whole point of --include-pm2, so the start transaction refuses.
+ */
+export function assertNoReplacementPm2God(pids: readonly number[]): void {
+  if (pids.length === 0) return;
+  throw new Error(
+    `[restart --include-pm2] a replacement PM2 God (pid ${pids.join(', ')}) appeared between God `
+    + 'retirement and the fleet start; it was not born from this restart\'s cleaned environment — '
+    + 'rerun `botmux restart --include-pm2`',
+  );
+}
+
 /**
  * Retire the sole live PM2 God, or return null when none is alive. Fails
  * closed — without mutating anything — on an invalid scan or multiple visible

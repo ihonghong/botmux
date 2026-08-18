@@ -268,6 +268,9 @@ describe('scrubInvokerTerminalEnv()', () => {
     for (const key of ['NO_COLOR', 'FORCE_COLOR', 'CODEX_CI', 'CI', 'TERM', 'TERMINFO', 'PAGER', 'GIT_PAGER', 'GH_PAGER']) {
       expect(INVOKER_TERMINAL_ENV_KEYS).toContain(key);
     }
+    // TERMINFO_DIRS is machine-level terminfo search-path config on
+    // NixOS/custom-ncurses hosts, not an invoker fingerprint — never scrub it.
+    expect(INVOKER_TERMINAL_ENV_KEYS).not.toContain('TERMINFO_DIRS');
   });
 });
 
@@ -296,6 +299,41 @@ describe('scrubSessionTurnMarkerEnv()', () => {
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_OWNER_OPEN_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('__OWNER_OPEN_ID');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_SESSION_ID');
+  });
+
+  it('is a whitelist difference over the injection contract, not a hand-kept copy', () => {
+    // Every per-session injected key is scrubbed at the pm2 boundary unless
+    // explicitly exempted — so a key added to BOTMUX_INJECTED_ENV_KEYS is
+    // covered by default. Session-scoped capabilities and markers must all be
+    // present, including the ones that are NOT display cosmetics.
+    for (const key of [
+      'BOTMUX_MCP_GATEWAY_SOCKET',
+      'BOTMUX_MCP_GATEWAY_REQUIRED',
+      'BOTMUX_DAEMON_IPC_PORT',
+      'BOTMUX_READ_ISOLATION',
+      'BOTMUX_READ_ISOLATED',
+      'BOTMUX_API_ONLY',
+      'IS_SANDBOX',
+      'BOTMUX_ORIGIN_CHANNEL_ID',
+      'BOTMUX_LARK_APP_ID',
+    ]) {
+      expect(SESSION_TURN_MARKER_ENV_KEYS, key).toContain(key);
+    }
+    // The exemptions are exactly the injected keys that double as legitimate
+    // non-session channels; everything in the contract is one or the other.
+    const exempt = [
+      'BOTS_CONFIG',                          // documented ambient registry pointer
+      'SESSION_DATA_DIR',                     // ecosystem env block → session-manager runtime reads
+      'BOTMUX_LARK_LIST_BOTS_API_ENABLED',    // documented ambient override (config.ts)
+      'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
+      'CLAUDE_CONFIG_DIR',                    // owned by scrubSessionCliHomeEnv
+      'CODEX_HOME',
+    ];
+    for (const key of exempt) {
+      expect(SESSION_TURN_MARKER_ENV_KEYS, key).not.toContain(key);
+    }
+    expect(new Set([...SESSION_TURN_MARKER_ENV_KEYS, ...exempt]))
+      .toEqual(new Set(BOTMUX_INJECTED_ENV_KEYS));
   });
 });
 

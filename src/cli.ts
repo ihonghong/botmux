@@ -149,7 +149,12 @@ import {
   restartFailurePathIn,
 } from './cli/restart-failure-notification.js';
 import { resolveRestartFailureOwner } from './cli/restart-failure-owner.js';
-import { retireSoleLivePm2God } from './cli/pm2-god-retirement.js';
+import {
+  assertNoReplacementPm2God,
+  assertPm2RegistryQuiescentForGodRetirement,
+  retireSoleLivePm2God,
+} from './cli/pm2-god-retirement.js';
+import { pm2FleetMutationLockTarget, withPm2FleetMutationLock } from './cli/pm2-fleet-lock.js';
 import {
   requestAttestedDaemonShutdown,
   requestAttestedDaemonShutdownBatch,
@@ -314,7 +319,9 @@ const PM2_NAME = 'botmux';
  * when those external pm2 installations get moved or removed.
  */
 const PM2_HOME = join(CONFIG_DIR, 'pm2');
-const PM2_FLEET_MUTATION_LOCK_TARGET = join(CONFIG_DIR, 'pm2-fleet-mutation');
+// Shared with plugin service-manager (src/cli/pm2-fleet-lock.ts): one lock
+// serializes every botmux-internal mutation of the shared PM2_HOME.
+const PM2_FLEET_MUTATION_LOCK_TARGET = pm2FleetMutationLockTarget();
 const PM2_START_COMMAND_TIMEOUT_MS = 30_000;
 // `pm2 kill` with an already-empty fleet only tears down the God + socket.
 const PM2_GOD_KILL_COMMAND_TIMEOUT_MS = 30_000;
@@ -2797,7 +2804,7 @@ async function cmdStart(): Promise<void> {
     }
   }
 
-  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+  await withPm2FleetMutationLock(async () => {
     await withFileLock(BOTS_JSON_FILE, async () => {
       const lockedBots = loadBotsJson();
       if (JSON.stringify(lockedBots) !== JSON.stringify(botsForCheck)) {
@@ -3608,7 +3615,7 @@ async function cmdStop(): Promise<void> {
     );
   }
   ensureConfigDir();
-  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+  await withPm2FleetMutationLock(async () => {
     assertNoDuplicatePm2GodDaemons();
     cleanupLegacyPm2(bootstrapShutdownProtocol ? 'stop' : undefined);
     if (bootstrapShutdownProtocol) {
@@ -3711,7 +3718,7 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+  await withPm2FleetMutationLock(async () => {
     const includePm2 = process.argv.includes('--include-pm2');
     const includePluginServices = process.argv.includes('--with-plugin');
     const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
@@ -3766,9 +3773,23 @@ async function cmdRestart(): Promise<void> {
     }
     // --include-pm2 tears down the whole PM2_HOME, so ALL plugin services get
     // a graceful stop first instead of dying with the God; auto ones are
-    // re-ensured after the restart, manually-started ones stay down.
-    if (includePm2) await stopPluginServicesForCli(undefined, {});
-    else if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+    // re-ensured after the restart, manually-started ones stay down. Stop
+    // errors are collected into reports rather than thrown (service-manager
+    // contract), so this path re-checks them: a service that failed to stop
+    // must block the God retirement below, not die with the God.
+    if (includePm2) {
+      const pluginStopReports = await stopPluginServicesForCli(undefined, {});
+      const failedStops = pluginStopReports.filter(report => report.action === 'failed');
+      if (failedStops.length > 0) {
+        throw new Error(
+          `[restart --include-pm2] plugin service(s) failed to stop gracefully: `
+          + `${failedStops.map(report => report.pluginId).join(', ')}; `
+          + 'the PM2 God and every remaining process were left untouched — fix or delete these services, then rerun',
+        );
+      }
+    } else if (includePluginServices) {
+      await stopPluginServicesForCli(undefined, { autoOnly: true });
+    }
     cleanupStaleDaemonDescriptors();
 
     const retiredProjection = readVerifiedBotmuxPm2Projection('restart-start');
@@ -3786,6 +3807,16 @@ async function cmdRestart(): Promise<void> {
     // new God from this CLI's (pm2Env-scrubbed) environment, which is what
     // makes --include-pm2 a genuinely complete restart.
     if (includePm2) {
+      // Independent whole-registry proof, not just the core projection above:
+      // every row still known to the God (a plugin stop that failed, an
+      // orphaned row from an uninstalled plugin) blocks the kill fail-closed.
+      assertPm2RegistryQuiescentForGodRetirement(
+        parsePm2JlistOutputStrict(pm2Capture(['jlist'])).map(row => ({
+          name: typeof row?.name === 'string' && row.name ? row.name : 'unknown',
+          status: typeof row?.pm2_env?.status === 'string' ? row.pm2_env.status : undefined,
+          pid: parsePm2Integer(row?.pid, { nonNegative: true }),
+        })),
+      );
       const retired = await retireSoleLivePm2God({
         listGodPids: () => listPm2GodDaemonPids(),
         readStartIdentity: pid => readSupervisorProcessStartIdentity(pid),
@@ -3824,6 +3855,10 @@ async function cmdRestart(): Promise<void> {
             start: timeoutMs => {
               assertBotsConfigSnapshotUnchanged('restart-start', restartBots);
               assertNoDuplicatePm2GodDaemons();
+              // After retiring the God this start must be the one to birth
+              // its successor; a God that appeared in between came from some
+              // other client's environment and is refused.
+              if (includePm2) assertNoReplacementPm2God(listPm2GodDaemonPids());
               preflightNodeSanity();
               runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
             },
@@ -3907,7 +3942,7 @@ async function ensureBotDaemonStopped(
 ): Promise<StopBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+    return await withPm2FleetMutationLock(async () => (
       withFileLock(BOTS_JSON_FILE, async () => {
         assertNoDuplicatePm2GodDaemons();
         preflightNodeSanity();
@@ -3976,7 +4011,7 @@ async function ensureBotDaemonStarted(
 ): Promise<StartBotLiveResult> {
   ensureConfigDir();
   try {
-    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+    return await withPm2FleetMutationLock(async () => (
       withFileLock(BOTS_JSON_FILE, async () => {
         assertNoDuplicatePm2GodDaemons();
         preflightNodeSanity();
@@ -12700,13 +12735,14 @@ async function reconcilePluginServicesForCli(
 async function stopPluginServicesForCli(
   pluginIds?: string[],
   options: { autoOnly?: boolean } = {},
-): Promise<void> {
+): Promise<import('./core/plugins/service-manager.js').PluginServiceReport[]> {
   const { stopPluginServices } = await import('./core/plugins/service-manager.js');
   const reports = await stopPluginServices(pluginIds, options);
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
   }
+  return reports;
 }
 
 function requirePluginId(raw: string | undefined): string {

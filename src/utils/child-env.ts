@@ -106,11 +106,14 @@ export const INVOKER_TERMINAL_ENV_KEYS = [
   'FORCE_COLOR',
   'CLICOLOR',
   'CLICOLOR_FORCE',
-  // Terminal identity
+  // Terminal identity. TERMINFO is a single-directory override that terminal
+  // apps export for their own private terminfo bundle — invoker-scoped.
+  // TERMINFO_DIRS is deliberately ABSENT: it is a search-path list that
+  // NixOS/home-manager and custom-ncurses setups configure machine-wide, and
+  // deleting it would break terminfo resolution for every PTY on such hosts.
   'TERM',
   'COLORTERM',
   'TERMINFO',
-  'TERMINFO_DIRS',
   'TERM_PROGRAM',
   'TERM_PROGRAM_VERSION',
   'TERM_SESSION_ID',
@@ -126,36 +129,6 @@ export const INVOKER_TERMINAL_ENV_KEYS = [
 /** Delete inherited invoker-terminal fingerprints from `env` in place. */
 export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
   for (const key of INVOKER_TERMINAL_ENV_KEYS) delete env[key];
-}
-
-/**
- * Turn-scoped botmux session identity of the process that invoked a pm2
- * mutation. A `botmux restart` issued from inside a bot session carries that
- * session's routing identity (session/chat/turn ids, the daemon-authenticated
- * owner — see the owner-identity invariants in CLAUDE.md); baked into the
- * fleet it makes every daemon carry a stale foreign turn identity, and a
- * plugin service started from the same env would misroute its own `botmux
- * send` to a long-dead thread. These keys are always computed per session by
- * the daemon/worker (BOTMUX_INJECTED_ENV_KEYS injection), never legitimate
- * ambient config, so the pm2 boundary deletes them unconditionally.
- * Deliberately narrow: keys that double as documented ambient daemon config
- * (BOTS_CONFIG, BOTMUX_PUBLIC_URL, …) stay out.
- */
-export const SESSION_TURN_MARKER_ENV_KEYS = [
-  'BOTMUX_SESSION_ID',
-  'BOTMUX_CHAT_ID',
-  'BOTMUX_CHAT_TYPE',
-  'BOTMUX_ROOT_MESSAGE_ID',
-  'BOTMUX_TURN_ID',
-  'BOTMUX_DISPATCH_ATTEMPT',
-  'BOTMUX_ORIGIN_CHANNEL_ID',
-  'BOTMUX_OWNER_OPEN_ID',
-  '__OWNER_OPEN_ID',
-] as const;
-
-/** Delete inherited turn-scoped session identity from `env` in place. */
-export function scrubSessionTurnMarkerEnv(env: NodeJS.ProcessEnv): void {
-  for (const key of SESSION_TURN_MARKER_ENV_KEYS) delete env[key];
 }
 
 /**
@@ -377,6 +350,53 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
 ] as const;
+
+/**
+ * Injected keys that must SURVIVE the pm2/daemon-boot turn-marker scrub, each
+ * because it doubles as a channel that is legitimate OUTSIDE a session turn:
+ *  - BOTS_CONFIG: documented ambient registry pointer, top of the registry
+ *    precedence chain (`BOTS_CONFIG=… botmux restart` flows).
+ *  - SESSION_DATA_DIR: delivered to every core app via the ecosystemConfig
+ *    env block; session-manager resolves stores through it at runtime, so a
+ *    daemon-boot scrub would break pairing/federation stores.
+ *  - BOTMUX_LARK_LIST_BOTS_API_*: documented ambient overrides read by
+ *    config.ts.
+ *  - CLAUDE_CONFIG_DIR / CODEX_HOME: owned by scrubSessionCliHomeEnv, which
+ *    carries their full story (GROK_HOME exemption, no-default-pinning).
+ */
+const TURN_MARKER_SCRUB_EXEMPT_KEYS: ReadonlySet<string> = new Set([
+  'BOTS_CONFIG',
+  'SESSION_DATA_DIR',
+  'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
+  'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
+  'CLAUDE_CONFIG_DIR',
+  'CODEX_HOME',
+]);
+
+/**
+ * Turn-scoped botmux session identity of the process that invoked a pm2
+ * mutation. A `botmux restart` issued from inside a bot session carries that
+ * session's routing identity — session/chat/turn ids, the
+ * daemon-authenticated owner (see the owner-identity invariants in
+ * CLAUDE.md), and session-scoped capabilities like the MCP gateway socket and
+ * the daemon IPC port. Persisted by pm2 into the fleet, it makes every daemon
+ * carry a stale foreign turn identity, and a plugin service started from the
+ * same env would misroute its own `botmux send` to a long-dead thread.
+ *
+ * Derived as a whitelist difference over BOTMUX_INJECTED_ENV_KEYS — the
+ * canonical inventory of per-session injected keys — rather than a hand-kept
+ * copy, so a key added to the injection contract is scrubbed at the pm2
+ * boundary by default and must be explicitly exempted (with a reason) to
+ * survive. Per-session values are unaffected: injection happens after every
+ * boundary scrub.
+ */
+export const SESSION_TURN_MARKER_ENV_KEYS: readonly string[] =
+  BOTMUX_INJECTED_ENV_KEYS.filter(key => !TURN_MARKER_SCRUB_EXEMPT_KEYS.has(key));
+
+/** Delete inherited turn-scoped session identity from `env` in place. */
+export function scrubSessionTurnMarkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of SESSION_TURN_MARKER_ENV_KEYS) delete env[key];
+}
 
 /** Proxy env vars that must reach the CLI child process so it can dial the
  *  upstream API on hosts without direct internet access. Forwarded explicitly

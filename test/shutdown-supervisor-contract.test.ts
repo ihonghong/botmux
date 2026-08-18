@@ -226,9 +226,26 @@ describe('graceful shutdown supervisor contract', () => {
       const region = cli.slice(start, end);
       expect(start, label).toBeGreaterThanOrEqual(0);
       expect(end, label).toBeGreaterThan(start);
-      expect(region, label).toContain('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
-      expect(region, label).not.toContain('withFileLockSync(PM2_FLEET_MUTATION_LOCK_TARGET');
+      expect(region, label).toContain('withPm2FleetMutationLock(');
+      expect(region, label).not.toContain('withPm2FleetMutationLockSync(');
     }
+
+    // Plugin services live under the SAME God, so their lifecycle must share
+    // the same fleet lock — in fixed order (fleet first, service second), and
+    // even for the status probe, whose pm2 jlist can lazily birth a God.
+    const serviceManager = readFileSync(
+      new URL('../src/core/plugins/service-manager.ts', import.meta.url), 'utf8',
+    );
+    expect(serviceManager).toContain(
+      'withPm2FleetMutationLockSync(\n    () => withFileLockSync(serviceLockTarget()',
+    );
+    expect(serviceManager).toContain(
+      'withPm2FleetMutationLock(\n    () => withFileLock(serviceLockTarget()',
+    );
+    const statusFn = serviceManager.slice(
+      serviceManager.indexOf('export async function listPluginServiceStatus('),
+    );
+    expect(statusFn.slice(0, statusFn.indexOf('\n}'))).toContain('withPluginServiceLock(');
 
     const exactHelper = cli.slice(
       cli.indexOf('async function cmdInternalPm2StartExact('),
@@ -418,14 +435,27 @@ describe('graceful shutdown supervisor contract', () => {
     const restart = cli.slice(start, end);
     const coreRetire = restart.indexOf('deleteAllBotmuxProcesses()');
     const pluginStop = restart.indexOf('stopPluginServicesForCli(undefined, {})');
+    const strictStops = restart.indexOf("report.action === 'failed'");
     const verifyEmpty = restart.indexOf("readVerifiedBotmuxPm2Projection('restart-start')");
+    const quiescentGate = restart.indexOf('assertPm2RegistryQuiescentForGodRetirement(');
     const godRetire = restart.indexOf('retireSoleLivePm2God(');
     const freshStart = restart.indexOf('runBoundedPm2StartTransaction(');
     expect(coreRetire).toBeGreaterThanOrEqual(0);
     expect(pluginStop).toBeGreaterThan(coreRetire);
-    expect(verifyEmpty).toBeGreaterThan(pluginStop);
-    expect(godRetire).toBeGreaterThan(verifyEmpty);
+    // A plugin stop failure is a collected report, not a thrown error — the
+    // include-pm2 path must re-check reports and refuse before touching the God.
+    expect(strictStops).toBeGreaterThan(pluginStop);
+    expect(verifyEmpty).toBeGreaterThan(strictStops);
+    // Whole-registry quiescence proof (plugin rows and orphans included)
+    // strictly between the core projection check and the kill.
+    expect(quiescentGate).toBeGreaterThan(verifyEmpty);
+    expect(godRetire).toBeGreaterThan(quiescentGate);
     expect(freshStart).toBeGreaterThan(godRetire);
+    // A God that appears between retirement and the fresh start was born from
+    // some other client's environment — the start transaction refuses it.
+    const replacementGuard = restart.indexOf('assertNoReplacementPm2God(listPm2GodDaemonPids())');
+    expect(replacementGuard).toBeGreaterThan(godRetire);
+    expect(replacementGuard).toBeLessThan(restart.indexOf("runPm2(['start', cfg], true, PM2_HOME, timeoutMs)"));
     // Socket-addressed kill only — a raw PID signal cannot be generation-bound.
     expect(restart).toContain("runPm2(['kill']");
     expect(restart).not.toContain('killPm2GodDaemon');

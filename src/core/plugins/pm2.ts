@@ -5,7 +5,13 @@ import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
-import { scrubInvokerTerminalEnv, scrubSessionTurnMarkerEnv } from '../../utils/child-env.js';
+import {
+  scrubClaudeSessionMarkerEnv,
+  scrubInvokerTerminalEnv,
+  scrubSessionCliHomeEnv,
+  scrubSessionTurnMarkerEnv,
+  scrubWorkflowWorkerEnv,
+} from '../../utils/child-env.js';
 
 const require = createRequire(import.meta.url);
 const BOTMUX_HOME = join(homedir(), '.botmux');
@@ -35,20 +41,26 @@ function pm2Env(extra?: Record<string, string>): NodeJS.ProcessEnv {
   // the plugin service is an arbitrary long-lived process that could launch a
   // foreground botmux, which would then exit 90 on a clean stop. See
   // stripPm2GracefulExitMarker.
-  const inherited = stripPm2GracefulExitMarker(process.env);
-  delete inherited.kill_timeout;
-  // Plugin PM2 shares the God's PM2_HOME, so this boundary can both bake the
-  // caller's env into a plugin app AND birth the God itself. Keep the same
-  // invoker hygiene as cli.ts pm2Env(): no agent-shell terminal fingerprints
-  // (NO_COLOR/CODEX_CI/… — see INVOKER_TERMINAL_ENV_KEYS), no turn-scoped
-  // session identity (a plugin service with a baked BOTMUX_SESSION_ID would
-  // misroute its own `botmux send` to a long-dead thread).
-  scrubInvokerTerminalEnv(inherited);
-  scrubSessionTurnMarkerEnv(inherited);
+  const merged = stripPm2GracefulExitMarker({ ...process.env, ...(extra ?? {}) });
+  delete merged.kill_timeout;
+  // Plugin PM2 shares the God's PM2_HOME, so this boundary both persists the
+  // caller's env into plugin apps AND can create the shared God itself. It
+  // therefore applies the SAME five scrub families as cli.ts pm2Env() — CLI
+  // home pointers, Claude session markers, workflow identity, invoker
+  // terminal fingerprints, turn-scoped session identity — and applies them
+  // AFTER the manifest env merge, so a plugin manifest cannot revive a
+  // scrubbed key (a service needing its own data root must resolve it
+  // internally, not via CLAUDE_CONFIG_DIR/CODEX_HOME).
+  scrubSessionCliHomeEnv(merged);
+  scrubClaudeSessionMarkerEnv(merged);
+  scrubWorkflowWorkerEnv(merged);
+  scrubInvokerTerminalEnv(merged);
+  scrubSessionTurnMarkerEnv(merged);
   // Same TERM re-pin as cli.ts pm2Env(): deterministic instead of absent, so
   // pm2 client output on a real TTY keeps color detection.
-  inherited.TERM = 'xterm-256color';
-  return { ...inherited, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
+  merged.TERM = 'xterm-256color';
+  merged.PM2_HOME = PLUGIN_PM2_HOME;
+  return merged;
 }
 
 export function runPluginPm2(args: string[], opts: { inherit?: boolean; timeoutMs?: number; env?: Record<string, string> } = {}): void {

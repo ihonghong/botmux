@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertNoReplacementPm2God,
+  assertPm2RegistryQuiescentForGodRetirement,
   retireSoleLivePm2God,
   type Pm2GodRetirementRuntime,
 } from '../src/cli/pm2-god-retirement.js';
@@ -93,5 +95,54 @@ describe('retireSoleLivePm2God', () => {
       killError: new Error('pm2 kill failed: status 1'),
     });
     await expect(retireSoleLivePm2God(rt)).rejects.toThrow(/pm2 kill failed/);
+  });
+});
+
+describe('assertPm2RegistryQuiescentForGodRetirement', () => {
+  it('accepts an empty registry and terminal rows without live pids', () => {
+    expect(() => assertPm2RegistryQuiescentForGodRetirement([])).not.toThrow();
+    expect(() => assertPm2RegistryQuiescentForGodRetirement([
+      { name: 'botmux-plugin-a', status: 'stopped', pid: undefined },
+      { name: 'botmux-plugin-b', status: 'stopped', pid: 0 },
+      { name: 'botmux-plugin-c', status: 'errored', pid: undefined },
+    ])).not.toThrow();
+  });
+
+  it('refuses when a plugin service failed to stop and is still online', () => {
+    expect(() => assertPm2RegistryQuiescentForGodRetirement([
+      { name: 'botmux-plugin-hung', status: 'online', pid: 4321 },
+    ])).toThrow(/still has live\/unproven row\(s\).*botmux-plugin-hung:online:pid 4321/s);
+  });
+
+  it('refuses an orphaned running row left behind by an uninstalled plugin', () => {
+    // stopPluginServices only iterates registry records that still carry a
+    // service definition; an uninstalled plugin's leftover PM2 row is invisible
+    // to it and MUST be caught here instead of dying silently with the God.
+    expect(() => assertPm2RegistryQuiescentForGodRetirement([
+      { name: 'botmux-plugin-uninstalled-leftover', status: 'online', pid: 555 },
+      { name: 'botmux-plugin-ok', status: 'stopped', pid: undefined },
+    ])).toThrow(/botmux-plugin-uninstalled-leftover/);
+  });
+
+  it('refuses non-terminal statuses even without a pid, and live pids even when "stopped"', () => {
+    for (const row of [
+      { name: 'r1', status: 'launching', pid: undefined },
+      { name: 'r2', status: 'stopping', pid: undefined },
+      { name: 'r3', status: undefined, pid: undefined },
+      { name: 'r4', status: 'stopped', pid: 999 },
+    ]) {
+      expect(() => assertPm2RegistryQuiescentForGodRetirement([row]), row.name).toThrow();
+    }
+  });
+});
+
+describe('assertNoReplacementPm2God', () => {
+  it('passes when no God exists right before the fresh start', () => {
+    expect(() => assertNoReplacementPm2God([])).not.toThrow();
+  });
+
+  it('refuses a God inserted between retirement and start', () => {
+    expect(() => assertNoReplacementPm2God([8123]))
+      .toThrow(/replacement PM2 God \(pid 8123\)/);
   });
 });

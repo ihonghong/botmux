@@ -26,11 +26,9 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 // v3 workflow workers spread this process's env into their spawn env, so a
 // restart issued from a bot session would otherwise pin that session's owner
 // onto every workflow CLI child.
+// (Covers BOTMUX_LARK_APP_ID too: the daemon resolves its own bot via
+// BOTMUX_BOT_INDEX and must not trust an inherited app id.)
 scrubSessionTurnMarkerEnv(process.env);
-// Daemon-boot-only extra: the daemon resolves its own bot via BOTMUX_BOT_INDEX
-// and must not trust an inherited app id. Kept out of the shared turn-marker
-// list because ecosystemConfig legitimately pins BOTMUX_LARK_APP_ID per app.
-delete process.env.BOTMUX_LARK_APP_ID;
 // Same vector, session-level CLI data-root pointers (CLAUDE_CONFIG_DIR /
 // CODEX_HOME): a value baked into pm2's saved app env — or resurrected from a
 // stale dump.pm2, which bypasses the pm2Env() strip in cli.ts — would make
